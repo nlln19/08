@@ -603,6 +603,7 @@
 
   function resumeTest() {
     if (!state.running || !state.paused) return;
+    requestFullScreen();
     const now = performance.now();
     const pausedFor = now - state.pauseStartedAt;
     state.endAt += pausedFor;
@@ -611,6 +612,15 @@
     el.pauseOverlay.classList.add('hidden');
     scheduleOuterEvent();
     scheduleCentralEvent();
+  }
+
+  function onFullscreenChange() {
+    // Browsers normally consume the first ESC press themselves while in native
+    // fullscreen. When that ESC exits fullscreen, pause 08 immediately so the
+    // player does not need to press ESC a second time.
+    if (!document.fullscreenElement && state.running && !state.paused && !state.countingDown) {
+      pauseTest();
+    }
   }
 
   function clearEventTimers() {
@@ -918,6 +928,7 @@
   el.downloadResultBtn.addEventListener('click', downloadResultJpg);
   el.resultBackBtn.addEventListener('click', () => showScreen(el.home));
   document.addEventListener('keydown', onKeyDown, { passive: false });
+  document.addEventListener('fullscreenchange', onFullscreenChange);
   window.addEventListener('resize', () => {
     if (state.running && state.cells.length) updateHiddenCenterCells();
   });
