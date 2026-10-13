@@ -24,12 +24,13 @@
   };
 
   const MAX_DURATION_MINUTES = 120;
-  const OUTER_TARGET_SLOT_MS = 5000;
+  const OUTER_SHORT_SLOT_MS = 3500;
+  const OUTER_NORMAL_SLOT_MS = 5000;
   const SWAP_INTERVAL_MS = 120;
   const OUTER_STIMULUS_MS = 260;
   const RESPONSE_WINDOW_MS = 1500;
-  const CENTRAL_WAIT_MIN_MS = 6000;
-  const CENTRAL_WAIT_MAX_MS = 12000;
+  const CENTRAL_WAIT_MIN_MS = 15000;
+  const CENTRAL_WAIT_MAX_MS = 25000;
   const HOME_DIGIT_SWAP_MS = 1200;
 
   const state = {
@@ -647,18 +648,27 @@
     renderGridDigits();
   }
 
+  function centerGridCells(cols, rows) {
+    // Always use a centre cut-out that matches the parity of the grid.
+    // This guarantees exactly the same number of visible fields on both
+    // sides of the centre for every preset.
+    return {
+      cols: cols % 2 === 0 ? [cols / 2 - 1, cols / 2] : [Math.floor(cols / 2)],
+      rows: rows % 2 === 0 ? [rows / 2 - 1, rows / 2] : [Math.floor(rows / 2)]
+    };
+  }
+
   function updateHiddenCenterCells() {
     // Keep the central cut-out tied to logical grid cells, not to the current
     // browser viewport. Native fullscreen changes the viewport size while ESC
     // is being handled; recomputing by pixel intersection made extra rows or
     // columns disappear around the centre after rapid pause/resume cycles.
     const { cols, rows } = gridPreset();
-    const centerCols = cols % 2 === 0 ? [cols / 2 - 1, cols / 2] : [Math.floor(cols / 2)];
-    const centerRows = rows % 2 === 0 ? [rows / 2 - 1, rows / 2] : [Math.floor(rows / 2)];
+    const center = centerGridCells(cols, rows);
     const hiddenIds = new Set();
 
-    centerRows.forEach(row => {
-      centerCols.forEach(col => hiddenIds.add(row * cols + col));
+    center.rows.forEach(row => {
+      center.cols.forEach(col => hiddenIds.add(row * cols + col));
     });
 
     state.availableOuter = [];
@@ -876,21 +886,32 @@
     return copy;
   }
 
+  function outerTargetSlotMs(durationMinutes) {
+    // Short rounds are intentionally denser. From 5 to 15 minutes the target
+    // gradually relaxes to the normal pace. Longer rounds keep the normal
+    // target and naturally spread out further once every available field is
+    // already part of the plan.
+    if (durationMinutes <= 5) return OUTER_SHORT_SLOT_MS;
+    if (durationMinutes >= 15) return OUTER_NORMAL_SLOT_MS;
+    const progress = (durationMinutes - 5) / 10;
+    return OUTER_SHORT_SLOT_MS + (OUTER_NORMAL_SLOT_MS - OUTER_SHORT_SLOT_MS) * progress;
+  }
+
   function prepareOuterPlan() {
     const durationMs = state.settings.durationMinutes * 60_000;
-    // Short games use a random subset. Long games can eventually use every
-    // available field, but never more than once. The plan is shuffled once
-    // and then paced across the complete selected game duration.
+    const targetSlotMs = outerTargetSlotMs(state.settings.durationMinutes);
+    // Every location can still appear at most once. Short sessions use more
+    // locations per minute, while long sessions can eventually use all fields.
     const plannedCount = Math.min(
       state.availableOuter.length,
-      Math.max(1, Math.floor(durationMs / OUTER_TARGET_SLOT_MS))
+      Math.max(1, Math.floor(durationMs / targetSlotMs))
     );
     state.outerPlan = shuffled(state.availableOuter).slice(0, plannedCount);
     state.outerPlanIndex = 0;
   }
 
   function scheduleOuterEvent() {
-    if (!state.running || state.paused || state.outerActive) return;
+    if (!state.running || state.paused) return;
     window.clearTimeout(state.outerWaitTimer);
 
     const remainingCount = state.outerPlan.length - state.outerPlanIndex;
@@ -899,14 +920,16 @@
     const remainingGameMs = Math.max(0, state.endAt - performance.now());
     if (remainingGameMs <= RESPONSE_WINDOW_MS + 100) return;
 
-    // Recalculate after every event so pauses and fast/slow responses do not
-    // make the plan run out early. A little jitter keeps locations/timing
-    // unpredictable while the overall sequence still spans the whole game.
+    // Use a deliberately wide random range instead of a narrow jitter around
+    // a fixed beat. Recomputing from the remaining time after every event
+    // keeps the complete plan spread across the session without creating a
+    // recognisable rhythm. The minimum is longer than the response window, so
+    // two outer stimuli cannot overlap.
     const idealSlotMs = remainingGameMs / remainingCount;
-    const latestSafeDelay = Math.max(250, remainingGameMs - RESPONSE_WINDOW_MS - 100);
-    const baseDelay = Math.max(350, idealSlotMs - RESPONSE_WINDOW_MS - 250);
-    const jitteredDelay = baseDelay * (0.8 + Math.random() * 0.3);
-    const delay = Math.min(latestSafeDelay, Math.max(350, jitteredDelay));
+    const randomFactor = 0.45 + Math.random() * 1.25;
+    const minDelay = RESPONSE_WINDOW_MS + 250;
+    const latestSafeDelay = Math.max(minDelay, remainingGameMs - RESPONSE_WINDOW_MS - 100);
+    const delay = Math.min(latestSafeDelay, Math.max(minDelay, idealSlotMs * randomFactor));
 
     state.outerWaitTimer = window.setTimeout(showOuterStimulus, delay);
   }
@@ -934,6 +957,9 @@
 
     window.clearTimeout(state.outerResponseTimer);
     state.outerResponseTimer = window.setTimeout(() => completeOuter(false, null), RESPONSE_WINDOW_MS);
+    // Schedule independently of the player's response so outer timing is not
+    // coupled to reaction speed or to the central stimulus sequence.
+    scheduleOuterEvent();
   }
 
   function completeOuter(detected, reactionTime) {
@@ -951,7 +977,6 @@
     });
     state.outerActive = null;
     window.clearTimeout(state.outerResponseTimer);
-    scheduleOuterEvent();
   }
 
   function scheduleCentralEvent() {
@@ -971,6 +996,9 @@
     };
     window.clearTimeout(state.centralResponseTimer);
     state.centralResponseTimer = window.setTimeout(() => completeCentral(false, null), RESPONSE_WINDOW_MS);
+    // The next center change is planned from the moment this change appears,
+    // not from the response. This keeps center and outer events independent.
+    scheduleCentralEvent();
   }
 
   function completeCentral(detected, reactionTime) {
@@ -983,7 +1011,6 @@
     });
     state.centralActive = null;
     window.clearTimeout(state.centralResponseTimer);
-    scheduleCentralEvent();
   }
 
   function onKeyDown(event) {
@@ -1321,17 +1348,16 @@
     const cellW = mapW / cols;
     const cellH = mapH / rows;
     const resultById = new Map((session.results || []).filter(r => r.type === 'outer').map(r => [r.id, r]));
-    const centerCols = Math.max(1, Math.ceil(116 / (960 / cols)));
-    const centerRows = Math.max(1, Math.ceil(112 / (540 / rows)));
-    const c0 = Math.floor((cols - centerCols) / 2);
-    const r0 = Math.floor((rows - centerRows) / 2);
+    const center = centerGridCells(cols, rows);
+    const centerColSet = new Set(center.cols);
+    const centerRowSet = new Set(center.rows);
 
     ctx.fillStyle = '#1e1e1e';
     ctx.fillRect(mapX, mapY, mapW, mapH);
     for (let row = 0; row < rows; row++) {
       for (let col = 0; col < cols; col++) {
         const id = row * cols + col;
-        const inCenter = col >= c0 && col < c0 + centerCols && row >= r0 && row < r0 + centerRows;
+        const inCenter = centerColSet.has(col) && centerRowSet.has(row);
         let fill = centerColor;
         if (!inCenter) {
           const r = resultById.get(id);
@@ -1513,17 +1539,16 @@
     el.resultMap.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
 
     const resultById = new Map((session.results || []).filter(r => r.type === 'outer').map(r => [r.id, r]));
-    const centerCols = Math.max(1, Math.ceil(116 / (960 / cols)));
-    const centerRows = Math.max(1, Math.ceil(112 / (540 / rows)));
-    const c0 = Math.floor((cols - centerCols) / 2);
-    const r0 = Math.floor((rows - centerRows) / 2);
+    const center = centerGridCells(cols, rows);
+    const centerColSet = new Set(center.cols);
+    const centerRowSet = new Set(center.rows);
 
     for (let row = 0; row < rows; row++) {
       for (let col = 0; col < cols; col++) {
         const id = row * cols + col;
         const div = document.createElement('div');
         div.className = 'result-cell';
-        const inCenter = col >= c0 && col < c0 + centerCols && row >= r0 && row < r0 + centerRows;
+        const inCenter = centerColSet.has(col) && centerRowSet.has(row);
         if (inCenter) {
           div.classList.add('center-hole');
         } else {
